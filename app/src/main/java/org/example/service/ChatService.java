@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import org.example.model.ConversationMessage;
 import org.example.model.DocumentChunkDocument;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -33,7 +34,9 @@ public class ChatService {
             "You are a helpful assistant. Answer the user's question using ONLY the context "
           + "provided below. If the answer is not in the context, say "
           + "'I could not find an answer in the uploaded document.' "
-          + "Do not make up information.";
+          + "Do not make up information. "
+          + "You have access to the conversation history — use it to answer follow-up questions "
+          + "and resolve pronouns or references to earlier turns.";
 
     private final HttpClient   httpClient;
     private final ObjectMapper objectMapper;
@@ -50,22 +53,34 @@ public class ChatService {
     // -----------------------------------------------------------------------
 
     /**
-     * Sends the question and retrieved context chunks to the OpenAI Chat Completions
-     * endpoint and returns the model's answer.
-     *
-     * @param question the user's question
-     * @param chunks   relevant document chunks returned by semantic search
-     * @return the assistant's answer text
-     * @throws RuntimeException on HTTP or JSON errors
+     * Single-turn variant (no history). Kept for backward compatibility.
      */
     public String askQuestion(String question, List<DocumentChunkDocument> chunks) {
-        log.info("Calling OpenAI Chat API with {} context chunks for question: '{}'",
-                chunks.size(), question);
+        return askQuestion(question, chunks, List.of());
+    }
+
+    /**
+     * Multi-turn variant. {@code history} is the ordered list of prior
+     * (user, assistant) message pairs for this session.
+     *
+     * Message order sent to OpenAI:
+     *   system (with injected context)
+     *   [history user/assistant pairs...]
+     *   user (current question)
+     *
+     * @param question the current user question
+     * @param chunks   relevant document chunks from semantic search
+     * @param history  prior conversation turns (may be empty)
+     * @return the assistant's answer text
+     */
+    public String askQuestion(String question,
+                              List<DocumentChunkDocument> chunks,
+                              List<ConversationMessage> history) {
+        log.info("Calling OpenAI Chat API: question='{}', chunks={}, historyTurns={}",
+                question, chunks.size(), history.size() / 2);
 
         try {
-            String userMessage = buildUserMessage(question, chunks);
-            String requestBody = buildRequestBody(userMessage);
-
+            String requestBody = buildRequestBody(question, chunks, history);
             log.debug("Chat request body length: {} chars", requestBody.length());
 
             HttpRequest request = HttpRequest.newBuilder()
@@ -86,7 +101,6 @@ public class ChatService {
                                 + ": " + response.body());
             }
 
-            // Parse: choices[0].message.content
             JsonNode root    = objectMapper.readTree(response.body());
             JsonNode choices = root.path("choices");
 
@@ -111,31 +125,42 @@ public class ChatService {
     // Helpers
     // -----------------------------------------------------------------------
 
-    private String buildUserMessage(String question, List<DocumentChunkDocument> chunks) {
-        StringBuilder sb = new StringBuilder("Context:\n");
-        for (DocumentChunkDocument chunk : chunks) {
-            sb.append(chunk.getContent()).append("\n\n");
-        }
-        sb.append("Question: ").append(question);
-        return sb.toString();
-    }
-
-    private String buildRequestBody(String userMessage) throws Exception {
-        ObjectNode body     = objectMapper.createObjectNode();
-        body.put("model",      chatModel);
-        body.put("max_tokens", 1000);
+    private String buildRequestBody(String question,
+                                    List<DocumentChunkDocument> chunks,
+                                    List<ConversationMessage> history) throws Exception {
+        ObjectNode body = objectMapper.createObjectNode();
+        body.put("model",       chatModel);
+        body.put("max_tokens",  1000);
         body.put("temperature", 0.2);
 
         ArrayNode messages = body.putArray("messages");
 
+        // 1. System message with injected context
         ObjectNode systemMsg = messages.addObject();
         systemMsg.put("role",    "system");
-        systemMsg.put("content", SYSTEM_PROMPT);
+        systemMsg.put("content", buildSystemContent(chunks));
 
+        // 2. Prior conversation turns (oldest first)
+        for (ConversationMessage msg : history) {
+            ObjectNode histMsg = messages.addObject();
+            histMsg.put("role",    msg.getRole());
+            histMsg.put("content", msg.getContent());
+        }
+
+        // 3. Current user question
         ObjectNode userMsg = messages.addObject();
         userMsg.put("role",    "user");
-        userMsg.put("content", userMessage);
+        userMsg.put("content", question);
 
         return objectMapper.writeValueAsString(body);
+    }
+
+    private String buildSystemContent(List<DocumentChunkDocument> chunks) {
+        StringBuilder sb = new StringBuilder(SYSTEM_PROMPT);
+        sb.append("\n\nContext:\n");
+        for (DocumentChunkDocument chunk : chunks) {
+            sb.append(chunk.getContent()).append("\n\n");
+        }
+        return sb.toString();
     }
 }
